@@ -63,8 +63,10 @@ impl LocalRedirector {
         }
         let conf = InterceptConf::try_from(spec.as_str())?;
         self.spec = spec;
+        #[cfg(target_os = "macos")]
+        let conf = MacosCommand::SetIntercept(conf);
         self.conf_tx
-            .send(conf.into())
+            .send(conf)
             .map_err(crate::util::event_queue_unavailable)?;
         Ok(())
     }
