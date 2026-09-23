@@ -1,6 +1,5 @@
 import NetworkExtension
 import OSLog
-import SwiftProtobuf
 import SwiftUI
 import SystemExtensions
 
@@ -9,6 +8,7 @@ let networkExtensionIdentifier = "org.mitmproxy.macos-redirector.network-extensi
 
 /// Helper app to install the system extension and setup the transaprent proxy.
 @main
+@MainActor
 struct App {
     static func main() async throws {
         let version = Bundle.main.infoDictionary!["CFBundleShortVersionString"] as! String
@@ -18,6 +18,16 @@ struct App {
             exitModal("This application only works on macOS 12 or above.")
         }
 
+        let arguments = Array(CommandLine.arguments.dropFirst())
+        if arguments.first == "--capture-safety" {
+            do {
+                let options = try CaptureSupervisorArguments(arguments)
+                exit(await CaptureSupervisor(arguments: options).run())
+            } catch {
+                FileHandle.standardOutput.write(Data("CAPTURE_START_FAILED\n".utf8))
+                exit(1)
+            }
+        }
         let unixSocketPath = CommandLine.arguments.last!
         if !unixSocketPath.starts(with: "/tmp/") {
             exitModal(
@@ -94,6 +104,7 @@ func startProxy(unixSocketPath: String) async throws {
         savedManagers.first(where: { m in
             (m.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier
                 == networkExtensionIdentifier
+                && (m.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration?["captureSafety"] as? Bool != true
                 && (!m.isEnabled || m.connection.status != NEVPNStatus.connected)
         }) ?? NETransparentProxyManager()
 

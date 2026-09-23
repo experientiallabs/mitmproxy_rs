@@ -18,6 +18,11 @@ pub struct Server {
 }
 
 impl Server {
+    #[cfg(target_os = "macos")]
+    pub(super) fn shutdown_receiver(&self) -> shutdown::Receiver {
+        self.shutdown_done.clone()
+    }
+
     pub fn close(&mut self) {
         if let Some(trigger) = self.start_shutdown.take() {
             log::debug!("Shutting down.");

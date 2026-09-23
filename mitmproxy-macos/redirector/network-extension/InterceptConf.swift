@@ -53,7 +53,7 @@ class InterceptConf {
     
     convenience init(from ipc: MitmproxyIpc_InterceptConf) throws {
         let actions = try ipc.actions.map { try Action(from: $0) }
-        let defaultAction = ipc.actions[0].hasPrefix("!")
+        let defaultAction = ipc.actions.first?.hasPrefix("!") ?? false
         self.init(defaultAction: defaultAction, actions: actions)
     }
     

@@ -19,6 +19,9 @@ pub struct LocalRedirector {
     server: Server,
     conf_tx: mpsc::UnboundedSender<InterceptConf>,
     spec: String,
+    #[cfg(target_os = "macos")]
+    capture_result:
+        Option<tokio::sync::watch::Receiver<mitmproxy::packet_sources::macos::CaptureResult>>,
 }
 
 impl LocalRedirector {
@@ -27,6 +30,8 @@ impl LocalRedirector {
             server,
             conf_tx,
             spec: "inactive".to_string(),
+            #[cfg(target_os = "macos")]
+            capture_result: None,
         }
     }
 }
@@ -58,6 +63,30 @@ impl LocalRedirector {
     }
 
     pub fn wait_closed<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+        #[cfg(target_os = "macos")]
+        if let Some(mut capture_result) = self.capture_result.clone() {
+            let mut closed = self.server.shutdown_receiver();
+            return pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                closed.recv().await;
+                let result = tokio::time::timeout(std::time::Duration::from_secs(18), async {
+                    loop {
+                        if let Some(result) = capture_result.borrow().clone() {
+                            return result;
+                        }
+                        if capture_result.changed().await.is_err() {
+                            return Err("Capture cleanup could not be confirmed.".into());
+                        }
+                    }
+                })
+                .await
+                .map_err(|_| {
+                    pyo3::exceptions::PyRuntimeError::new_err(
+                        "Capture cleanup could not be confirmed.",
+                    )
+                })?;
+                result.map_err(pyo3::exceptions::PyRuntimeError::new_err)
+            });
+        }
         self.server.wait_closed(py)
     }
 
@@ -92,15 +121,24 @@ impl LocalRedirector {
 ///
 /// - `handle_tcp_stream`: An async function that will be called for each new TCP `Stream`.
 /// - `handle_udp_stream`: An async function that will be called for each new UDP `Stream`.
+/// - `capture_domains`: Opt into the macOS Capture supervisor for these provider hostnames.
 ///
 /// *Availability: Windows, Linux, and macOS*
 #[pyfunction]
+#[pyo3(signature = (handle_tcp_stream, handle_udp_stream, *, capture_domains=None))]
 #[allow(unused_variables)]
 pub fn start_local_redirector(
     py: Python<'_>,
     handle_tcp_stream: Py<PyAny>,
     handle_udp_stream: Py<PyAny>,
+    capture_domains: Option<Vec<String>>,
 ) -> PyResult<Bound<'_, PyAny>> {
+    #[cfg(not(target_os = "macos"))]
+    if capture_domains.is_some() {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "Capture safety mode is available only on macOS.",
+        ));
+    }
     #[cfg(windows)]
     {
         let executable_path: std::path::PathBuf = py
@@ -137,28 +175,62 @@ pub fn start_local_redirector(
     }
     #[cfg(target_os = "macos")]
     {
+        let conf = MacosConf::new(capture_domains)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
         let module_filename = py.import("mitmproxy_macos")?.filename()?;
         let redirector_tar = std::path::Path::new(module_filename.to_str()?)
             .parent()
             .ok_or_else(|| anyhow::anyhow!("invalid path"))?
             .join("Mitmproxy Redirector.app.tar");
         let copy_task = macos::copy_redirector_app(redirector_tar)?;
-        let conf = MacosConf;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             if let Some(copy_task) = copy_task {
                 tokio::task::spawn_blocking(copy_task)
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to copy: {e}"))??;
             }
-            let (server, conf_tx) =
-                Server::init(conf, handle_tcp_stream, handle_udp_stream).await?;
-            Ok(LocalRedirector::new(server, conf_tx))
+            let (server, data) = Server::init(conf, handle_tcp_stream, handle_udp_stream).await?;
+            let mut redirector = LocalRedirector::new(server, data.conf_tx);
+            redirector.capture_result = data.capture_result;
+            Ok(redirector)
         })
     }
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     Err(pyo3::exceptions::PyNotImplementedError::new_err(
         LocalRedirector::unavailable_reason(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(not(target_os = "macos"))]
+    use pyo3::exceptions::PyNotImplementedError;
+    use pyo3::exceptions::PyTypeError;
+    use pyo3::types::PyDict;
+
+    #[test]
+    fn capture_option_is_keyword_only_and_rejects_invalid_targets_before_starting() {
+        Python::initialize();
+        Python::attach(|py| {
+            let function = pyo3::wrap_pyfunction!(start_local_redirector, py).unwrap();
+            let positional = function
+                .call1((py.None(), py.None(), Vec::<String>::new()))
+                .unwrap_err();
+            assert!(positional.is_instance_of::<PyTypeError>(py));
+            for domains in [vec![], vec!["localhost"], vec!["api.openai.com"; 33]] {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("capture_domains", domains).unwrap();
+                let error = function
+                    .call((py.None(), py.None()), Some(&kwargs))
+                    .unwrap_err();
+                #[cfg(target_os = "macos")]
+                assert!(error.is_instance_of::<PyValueError>(py));
+                #[cfg(not(target_os = "macos"))]
+                assert!(error.is_instance_of::<PyNotImplementedError>(py));
+            }
+        });
+    }
 }
 
 #[cfg(target_os = "macos")]
