@@ -2161,6 +2161,7 @@ dependencies = [
  "pyo3-log",
  "rand_core 0.6.4",
  "tar",
+ "tempfile",
  "tokio",
 ]
 
