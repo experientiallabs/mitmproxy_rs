@@ -4,29 +4,40 @@ use pyo3::exceptions::PyValueError;
 #[cfg(target_os = "linux")]
 use mitmproxy::packet_sources::linux::LinuxConf;
 #[cfg(target_os = "macos")]
-use mitmproxy::packet_sources::macos::MacosConf;
+use mitmproxy::packet_sources::macos::{MacosCommand, MacosConf};
 #[cfg(windows)]
 use mitmproxy::packet_sources::windows::WindowsConf;
 
 use pyo3::prelude::*;
+#[cfg(target_os = "macos")]
+use std::os::fd::{AsRawFd, IntoRawFd};
 
 use crate::server::base::Server;
 use tokio::sync::mpsc;
+
+#[cfg(target_os = "macos")]
+type LocalCommand = MacosCommand;
+#[cfg(not(target_os = "macos"))]
+type LocalCommand = InterceptConf;
 
 #[pyclass(module = "mitmproxy_rs.local")]
 #[derive(Debug)]
 pub struct LocalRedirector {
     server: Server,
-    conf_tx: mpsc::UnboundedSender<InterceptConf>,
+    conf_tx: mpsc::UnboundedSender<LocalCommand>,
     spec: String,
+    #[cfg(target_os = "macos")]
+    control_transferred: bool,
 }
 
 impl LocalRedirector {
-    pub fn new(server: Server, conf_tx: mpsc::UnboundedSender<InterceptConf>) -> Self {
+    pub fn new(server: Server, conf_tx: mpsc::UnboundedSender<LocalCommand>) -> Self {
         Self {
             server,
             conf_tx,
             spec: "inactive".to_string(),
+            #[cfg(target_os = "macos")]
+            control_transferred: false,
         }
     }
 }
@@ -44,12 +55,49 @@ impl LocalRedirector {
 
     /// Set a new intercept spec.
     pub fn set_intercept(&mut self, spec: String) -> PyResult<()> {
+        #[cfg(target_os = "macos")]
+        if self.control_transferred {
+            return Err(PyValueError::new_err(
+                "The watchdog owns the control socket.",
+            ));
+        }
         let conf = InterceptConf::try_from(spec.as_str())?;
         self.spec = spec;
         self.conf_tx
-            .send(conf)
+            .send(conf.into())
             .map_err(crate::util::event_queue_unavailable)?;
         Ok(())
+    }
+
+    /// Transfer exclusive control writes to a Python socket owned by a watchdog.
+    /// This awaits earlier configurations and disables subsequent set_intercept calls.
+    #[cfg(target_os = "macos")]
+    fn take_control_socket<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        if self.control_transferred {
+            return Err(PyValueError::new_err(
+                "The watchdog already owns the control socket.",
+            ));
+        }
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        self.conf_tx
+            .send(MacosCommand::TakeControl(reply))
+            .map_err(crate::util::event_queue_unavailable)?;
+        self.control_transferred = true;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let fd = receiver
+                .await
+                .map_err(|_| anyhow::anyhow!("Control transfer failed."))?;
+            Python::attach(|py| -> PyResult<Py<PyAny>> {
+                let kwargs = pyo3::types::PyDict::new(py);
+                kwargs.set_item("fileno", fd.as_raw_fd())?;
+                let socket = py
+                    .import("socket")?
+                    .getattr("socket")?
+                    .call((), Some(&kwargs))?;
+                let _ = fd.into_raw_fd(); // The Python socket now owns the descriptor, including cancellation.
+                Ok(socket.unbind())
+            })
+        })
     }
 
     /// Close the OS proxy server.

@@ -1,4 +1,5 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::os::fd::{AsFd, OwnedFd};
 
 use crate::messages::{ConnectionIdGenerator, TransportCommand, TransportEvent, TunnelInfo};
 
@@ -32,6 +33,18 @@ use tokio::time::timeout;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 pub struct MacosConf;
+
+/// Serialize configuration and control ownership transfer on the native loop.
+pub enum MacosCommand {
+    SetIntercept(InterceptConf),
+    TakeControl(oneshot::Sender<OwnedFd>),
+}
+
+impl From<InterceptConf> for MacosCommand {
+    fn from(conf: InterceptConf) -> Self {
+        Self::SetIntercept(conf)
+    }
+}
 
 async fn start_redirector(listener_addr: String) -> Result<()> {
     log::debug!("Starting redirector app...");
@@ -69,7 +82,7 @@ async fn start_redirector(listener_addr: String) -> Result<()> {
 
 impl PacketSourceConf for MacosConf {
     type Task = MacOsTask;
-    type Data = UnboundedSender<InterceptConf>;
+    type Data = UnboundedSender<MacosCommand>;
 
     fn name(&self) -> &'static str {
         "macOS proxy"
@@ -114,13 +127,14 @@ pub struct MacOsTask {
     listener: UnixListener,
     connections: JoinSet<Result<()>>,
     transport_events_tx: Sender<TransportEvent>,
-    conf_rx: UnboundedReceiver<InterceptConf>,
+    conf_rx: UnboundedReceiver<MacosCommand>,
     shutdown: shutdown::Receiver,
 }
 
 impl PacketSourceTask for MacOsTask {
     async fn run(mut self) -> Result<()> {
         let mut control_channel = Framed::new(self.control_channel, LengthDelimitedCodec::new());
+        let mut transferred = false;
 
         loop {
             tokio::select! {
@@ -151,9 +165,22 @@ impl PacketSourceTask for MacOsTask {
                     }
                 },
                 // pipe through changes to the intercept list
-                Some(conf) = self.conf_rx.recv() => {
-                    let msg = ipc::InterceptConf::from(conf).encode_to_vec();
-                    control_channel.send(Bytes::from(msg)).await.context("Failed to write to control channel")?;
+                Some(command) = self.conf_rx.recv() => {
+                    match command {
+                        MacosCommand::SetIntercept(conf) if !transferred => {
+                            let msg = ipc::InterceptConf::from(conf).encode_to_vec();
+                            control_channel.send(Bytes::from(msg)).await.context("Failed to write to control channel")?;
+                        }
+                        MacosCommand::TakeControl(reply) if !transferred => {
+                            // All earlier frames have been flushed. The watchdog becomes
+                            // the only writer, so an owner crash cannot truncate its frame.
+                            let fd = control_channel.get_ref().as_fd().try_clone_to_owned()?;
+                            if reply.send(fd).is_ok() {
+                                transferred = true;
+                            }
+                        }
+                        _ => bail!("macOS control channel ownership already transferred"),
+                    }
                 },
             }
         }
@@ -246,7 +273,11 @@ impl ConnectionTask {
         loop {
             tokio::select! {
                 _ = self.shutdown.recv() => break,
-                Some(packet) = stream.next(), if state.packet_queue_len() < 10 => {
+                packet = stream.next(), if state.packet_queue_len() < 10 => {
+                    let Some(packet) = packet else {
+                        state.close();
+                        break;
+                    };
                     let packet = ipc::UdpPacket::decode(
                         packet.context("IPC read error")?
                     ).context("invalid IPC message")?;
@@ -285,7 +316,7 @@ impl ConnectionTask {
                             write_buf.reserve(packet.encoded_len());
                             packet.encode(&mut write_buf)?;
                             // Awaiting here isn't ideal because it blocks reading, but what to do.
-                            stream.send(write_buf.split().freeze()).await.ok();
+                            stream.send(write_buf.split().freeze()).await.context("IPC write error")?;
                         },
                         TransportCommand::DrainWriter(_, tx) => {
                             tx.send(()).ok();
@@ -378,5 +409,177 @@ impl ConnectionTask {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    fn udp_flow() -> UdpFlow {
+        UdpFlow {
+            local_address: Some(ipc::Address {
+                host: "127.0.0.1".into(),
+                port: 53001,
+            }),
+            tunnel_info: Some(ipc::TunnelInfo {
+                pid: Some(42),
+                process_name: None,
+            }),
+        }
+    }
+
+    fn datagram() -> Bytes {
+        Bytes::from(
+            ipc::UdpPacket {
+                data: Bytes::from_static(b"query"),
+                remote_address: Some(ipc::Address {
+                    host: "127.0.0.1".into(),
+                    port: 53,
+                }),
+            }
+            .encode_to_vec(),
+        )
+    }
+
+    #[tokio::test]
+    async fn control_transfer_flushes_configuration_and_leaves_watchdog_socket_alive() {
+        let (extension, proxy) = UnixStream::pair().unwrap();
+        let path = format!(
+            "/tmp/exp-control-test-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        );
+        let listener = UnixListener::bind(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let (conf_tx, conf_rx) = unbounded_channel();
+        let (events, _received) = mpsc::channel(1);
+        let (owner, shutdown) = shutdown::channel();
+        let task = tokio::spawn(
+            MacOsTask {
+                control_channel: proxy,
+                listener,
+                connections: JoinSet::new(),
+                transport_events_tx: events,
+                conf_rx,
+                shutdown,
+            }
+            .run(),
+        );
+        conf_tx
+            .send(MacosCommand::SetIntercept(
+                InterceptConf::try_from("0,!0").unwrap(),
+            ))
+            .unwrap();
+        let (reply, receiver) = oneshot::channel();
+        conf_tx.send(MacosCommand::TakeControl(reply)).unwrap();
+        let owned = timeout(Duration::from_secs(1), receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut extension = Framed::new(extension, LengthDelimitedCodec::new());
+        let first = extension.next().await.unwrap().unwrap();
+        assert_eq!(
+            ipc::InterceptConf::decode(first).unwrap().actions,
+            ["0", "!0"]
+        );
+        owner.send(()).unwrap();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        // The independent owner can still disable the extension after the native task exits.
+        let std_socket = std::os::unix::net::UnixStream::from(owned);
+        let mut watchdog = Framed::new(
+            UnixStream::from_std(std_socket).unwrap(),
+            LengthDelimitedCodec::new(),
+        );
+        watchdog
+            .send(Bytes::from(
+                ipc::InterceptConf {
+                    actions: vec!["0".into(), "!0".into()],
+                }
+                .encode_to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            ipc::InterceptConf::decode(extension.next().await.unwrap().unwrap())
+                .unwrap()
+                .actions,
+            ["0", "!0"]
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_eof_before_first_datagram_releases_task() {
+        let (extension, proxy) = UnixStream::pair().unwrap();
+        let (events, mut received) = mpsc::channel(1);
+        let (_owner, shutdown) = shutdown::channel();
+        let task =
+            tokio::spawn(ConnectionTask::new(proxy, events, shutdown).handle_udp(udp_flow()));
+        drop(extension);
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(received.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn udp_eof_after_datagram_wakes_pending_reader() {
+        let (extension, proxy) = UnixStream::pair().unwrap();
+        let (events, mut received) = mpsc::channel(1);
+        let (_owner, shutdown) = shutdown::channel();
+        let task =
+            tokio::spawn(ConnectionTask::new(proxy, events, shutdown).handle_udp(udp_flow()));
+        let mut extension = Framed::new(extension, LengthDelimitedCodec::new());
+        extension.send(datagram()).await.unwrap();
+        let TransportEvent::ConnectionEstablished {
+            connection_id,
+            command_tx: Some(commands),
+            ..
+        } = received.recv().await.unwrap()
+        else {
+            panic!("missing connection")
+        };
+        let (tx, rx) = oneshot::channel();
+        commands
+            .send(TransportCommand::ReadData(connection_id, 0, tx))
+            .unwrap();
+        assert_eq!(rx.await.unwrap(), b"query");
+        let (tx, rx) = oneshot::channel();
+        commands
+            .send(TransportCommand::ReadData(connection_id, 0, tx))
+            .unwrap();
+        drop(extension);
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(rx.await.is_err());
+        assert!(commands.is_closed());
+    }
+
+    #[tokio::test]
+    async fn udp_stays_open_while_owner_exists_and_closes_on_shutdown() {
+        let (extension, proxy) = UnixStream::pair().unwrap();
+        let (events, _received) = mpsc::channel(1);
+        let (owner, shutdown) = shutdown::channel();
+        let mut task =
+            tokio::spawn(ConnectionTask::new(proxy, events, shutdown).handle_udp(udp_flow()));
+        assert!(timeout(Duration::from_millis(20), &mut task).await.is_err());
+        owner.send(()).unwrap();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut extension = Framed::new(extension, LengthDelimitedCodec::new());
+        assert!(extension.next().await.is_none());
     }
 }

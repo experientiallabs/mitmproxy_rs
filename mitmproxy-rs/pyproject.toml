@@ -3,8 +3,8 @@ requires = ["maturin>=1,<2"]
 build-backend = "maturin"
 
 [project]
-name = "mitmproxy_rs"
-dynamic = ["version"]
+name = "exp-mitmproxy-rs"
+version = "0.12.11.post1"
 requires-python = ">=3.12"
 classifiers = [
     "Programming Language :: Rust",
@@ -17,9 +17,9 @@ classifiers = [
 ]
 
 dependencies = [
-    "mitmproxy_windows; os_name == 'nt'",
-    "mitmproxy_linux; sys_platform == 'linux'",
-    "mitmproxy_macos; sys_platform == 'darwin'",
+    "mitmproxy_windows==0.12.11; os_name == 'nt'",
+    "mitmproxy_linux==0.12.11; sys_platform == 'linux'",
+    "mitmproxy_macos==0.12.11; sys_platform == 'darwin'",
 ]
 
 [tool.black]
@@ -36,4 +36,6 @@ exclude = [
 
 # https://pyo3.rs/v0.22.2/faq.html?highlight=cargo%20test#i-cant-run-cargo-test-or-i-cant-build-in-a-cargo-workspace-im-having-linker-issues-like-symbol-not-found-or-undefined-reference-to-_pyexc_systemerror
 [tool.maturin]
+module-name = "mitmproxy_rs.mitmproxy_rs"
+python-source = "."
 features = ["pyo3/extension-module"]
