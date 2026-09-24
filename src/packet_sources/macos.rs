@@ -1,7 +1,10 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::{AsFd, OwnedFd};
 
-use crate::messages::{ConnectionIdGenerator, TransportCommand, TransportEvent, TunnelInfo};
+use crate::messages::{
+    ConnectionId, ConnectionIdGenerator, TransportCommand, TransportEvent, TunnelInfo,
+};
 
 use crate::intercept_conf::InterceptConf;
 use crate::ipc;
@@ -263,19 +266,16 @@ impl ConnectionTask {
             SocketAddr::try_from(addr)
                 .with_context(|| format!("invalid local_address: {addr:?}"))?
         };
-        let mut remote_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
         let (command_tx, mut command_rx) = unbounded_channel();
-
-        let mut first_packet = Some((tunnel_info, local_address, command_tx));
-
-        let mut state = ConnectionState::default();
+        let mut ids = ConnectionIdGenerator::udp();
+        let mut destinations: HashMap<SocketAddr, ConnectionId> = HashMap::new();
+        let mut peers: HashMap<ConnectionId, (SocketAddr, ConnectionState)> = HashMap::new();
 
         loop {
             tokio::select! {
                 _ = self.shutdown.recv() => break,
-                packet = stream.next(), if state.packet_queue_len() < 10 => {
+                packet = stream.next(), if peers.values().map(|(_, state)| state.packet_queue_len()).sum::<usize>() < 10 => {
                     let Some(packet) = packet else {
-                        state.close();
                         break;
                     };
                     let packet = ipc::UdpPacket::decode(
@@ -286,32 +286,40 @@ impl ConnectionTask {
                         SocketAddr::try_from(dst_addr).with_context(|| format!("invalid remote_address: {dst_addr:?}"))?
                     };
 
-                    // We can only send ConnectionEstablished once we know the destination address.
-                    if let Some((tunnel_info, local_address, command_tx)) = first_packet.take() {
-                        remote_address = dst_addr;
+                    // One unconnected application socket can send to multiple endpoints.
+                    // Give each peer a transport while retaining the shared socket lifetime.
+                    let id = if let Some(id) = destinations.get(&dst_addr) {
+                        *id
+                    } else {
+                        let id = ids.next_id();
                         self.events.send(TransportEvent::ConnectionEstablished {
-                            connection_id: ConnectionIdGenerator::udp().next_id(),
+                            connection_id: id,
                             src_addr: local_address,
                             dst_addr,
-                            tunnel_info,
-                            command_tx: Some(command_tx),
+                            tunnel_info: tunnel_info.clone(),
+                            command_tx: Some(command_tx.clone()),
                         }).await?;
-                    } else if remote_address != dst_addr {
-                        bail!("UDP packet destinations do not match: {remote_address} -> {dst_addr}")
-                    }
+                        destinations.insert(dst_addr, id);
+                        peers.insert(id, (dst_addr, ConnectionState::default()));
+                        id
+                    };
                     // TODO: Make ConnectionState accept Bytes, not Vec<u8>
-                    state.add_packet(packet.data.to_vec());
+                    peers.get_mut(&id).unwrap().1.add_packet(packet.data.to_vec());
                 },
                 Some(command) = command_rx.recv() => {
                     match command {
-                        TransportCommand::ReadData(_, _, tx) => {
-                            state.add_reader(tx);
+                        TransportCommand::ReadData(id, _, tx) => {
+                            if let Some((_, state)) = peers.get_mut(&id) {
+                                state.add_reader(tx);
+                            }
                         },
-                        TransportCommand::WriteData(_, data) => {
-                            assert!(first_packet.is_none());
+                        TransportCommand::WriteData(id, data) => {
+                            let Some((remote_address, _)) = peers.get(&id) else {
+                                continue;
+                            };
                             let packet = ipc::UdpPacket {
                                 data: Bytes::from(data),
-                                remote_address: Some(remote_address.into()),
+                                remote_address: Some((*remote_address).into()),
                             };
                             write_buf.reserve(packet.encoded_len());
                             packet.encode(&mut write_buf)?;
@@ -321,10 +329,10 @@ impl ConnectionTask {
                         TransportCommand::DrainWriter(_, tx) => {
                             tx.send(()).ok();
                         },
-                        TransportCommand::CloseConnection(_, half_close) => {
-                            if !half_close {
+                        TransportCommand::CloseConnection(id, half_close) => {
+                            if !half_close && let Some((address, mut state)) = peers.remove(&id) {
                                 state.close();
-                                break;
+                                destinations.remove(&address);
                             }
                         }
                     }
@@ -511,6 +519,137 @@ mod tests {
                 .actions,
             ["0", "!0"]
         );
+    }
+
+    #[tokio::test]
+    async fn udp_socket_routes_multiple_destinations_independently() {
+        let (extension, proxy) = UnixStream::pair().unwrap();
+        let (events, mut received) = mpsc::channel(4);
+        let (_owner, shutdown) = shutdown::channel();
+        let task =
+            tokio::spawn(ConnectionTask::new(proxy, events, shutdown).handle_udp(udp_flow()));
+        let mut extension = Framed::new(extension, LengthDelimitedCodec::new());
+        let mut peers = Vec::new();
+        for host in ["192.0.2.1", "192.0.2.2"] {
+            let remote_address = ipc::Address {
+                host: host.into(),
+                port: 53,
+            };
+            let packet = ipc::UdpPacket {
+                data: Bytes::from_static(b"query"),
+                remote_address: Some(remote_address.clone()),
+            };
+            extension
+                .send(Bytes::from(packet.encode_to_vec()))
+                .await
+                .unwrap();
+            let TransportEvent::ConnectionEstablished {
+                connection_id,
+                dst_addr,
+                command_tx: Some(commands),
+                ..
+            } = timeout(Duration::from_secs(1), received.recv())
+                .await
+                .unwrap()
+                .expect("each destination must have a live transport")
+            else {
+                panic!("missing connection")
+            };
+            assert_eq!(dst_addr, SocketAddr::try_from(&remote_address).unwrap());
+            let (tx, rx) = oneshot::channel();
+            commands
+                .send(TransportCommand::ReadData(connection_id, 0, tx))
+                .unwrap();
+            assert_eq!(rx.await.unwrap(), b"query");
+            peers.push((connection_id, commands, remote_address));
+        }
+        assert_ne!(peers[0].0, peers[1].0);
+        // Replies arrive in reverse order and must retain their source endpoint.
+        for (id, commands, address) in peers.iter().rev() {
+            commands
+                .send(TransportCommand::WriteData(*id, b"reply".to_vec()))
+                .unwrap();
+            let reply = timeout(Duration::from_secs(1), extension.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let reply = ipc::UdpPacket::decode(reply).unwrap();
+            assert_eq!(reply.remote_address.as_ref(), Some(address));
+            assert_eq!(reply.data.as_ref(), b"reply");
+        }
+        // Switching back reuses the first live transport instead of destroying the socket.
+        let (id, commands, address) = &peers[0];
+        extension
+            .send(Bytes::from(
+                ipc::UdpPacket {
+                    data: Bytes::from_static(b"again"),
+                    remote_address: Some(address.clone()),
+                }
+                .encode_to_vec(),
+            ))
+            .await
+            .unwrap();
+        let (tx, rx) = oneshot::channel();
+        commands
+            .send(TransportCommand::ReadData(*id, 0, tx))
+            .unwrap();
+        assert_eq!(rx.await.unwrap(), b"again");
+        assert!(received.try_recv().is_err());
+        // Closing one peer must not close the application socket or its other peer.
+        commands
+            .send(TransportCommand::CloseConnection(*id, false))
+            .unwrap();
+        let (tx, rx) = oneshot::channel();
+        commands
+            .send(TransportCommand::ReadData(*id, 0, tx))
+            .unwrap();
+        assert!(rx.await.is_err());
+        let (other_id, other_commands, other_address) = &peers[1];
+        let (tx, rx) = oneshot::channel();
+        other_commands
+            .send(TransportCommand::ReadData(*other_id, 0, tx))
+            .unwrap();
+        extension
+            .send(Bytes::from(
+                ipc::UdpPacket {
+                    data: Bytes::from_static(b"still open"),
+                    remote_address: Some(other_address.clone()),
+                }
+                .encode_to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rx.await.unwrap(), b"still open");
+        // A closed peer can be contacted again without reusing its old transport ID.
+        extension
+            .send(Bytes::from(
+                ipc::UdpPacket {
+                    data: Bytes::from_static(b"reopen"),
+                    remote_address: Some(address.clone()),
+                }
+                .encode_to_vec(),
+            ))
+            .await
+            .unwrap();
+        let TransportEvent::ConnectionEstablished { connection_id, .. } =
+            timeout(Duration::from_secs(1), received.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_ne!(connection_id, *id);
+        let (tx, rx) = oneshot::channel();
+        other_commands
+            .send(TransportCommand::ReadData(*other_id, 0, tx))
+            .unwrap();
+        drop(extension);
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(rx.await.is_err());
+        assert!(peers.iter().all(|(_, commands, _)| commands.is_closed()));
     }
 
     #[tokio::test]
