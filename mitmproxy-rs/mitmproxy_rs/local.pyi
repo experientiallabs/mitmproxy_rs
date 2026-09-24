@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import socket
+import sys
+
 from collections.abc import Awaitable, Callable
 from typing import final
 from . import Stream
@@ -13,6 +16,10 @@ class LocalRedirector:
     @staticmethod
     def describe_spec(spec: str) -> None: ...
     def set_intercept(self, spec: str) -> None: ...
+    if sys.platform == "darwin":
+        @staticmethod
+        def installation_is_current() -> bool: ...
+        async def take_control_socket(self) -> socket.socket: ...
     def close(self) -> None: ...
     async def wait_closed(self) -> None: ...
     @staticmethod

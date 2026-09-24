@@ -28,7 +28,7 @@ jobs:
 
       - run: maturin build --features docs,pyo3/extension-module
         working-directory: ./mitmproxy-rs
-      - run: pip install --no-index --no-dependencies --find-links target/wheels/ mitmproxy_rs
+      - run: pip install --no-index --no-dependencies --find-links target/wheels/ exp-mitmproxy-rs
 
       - run: stubtest --allowlist mitmproxy-rs/stubtest-allowlist.txt --mypy-config-file mitmproxy-rs/pyproject.toml mitmproxy_rs
 
