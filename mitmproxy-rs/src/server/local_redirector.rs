@@ -4,35 +4,56 @@ use pyo3::exceptions::PyValueError;
 #[cfg(target_os = "linux")]
 use mitmproxy::packet_sources::linux::LinuxConf;
 #[cfg(target_os = "macos")]
-use mitmproxy::packet_sources::macos::MacosConf;
+use mitmproxy::packet_sources::macos::{MacosCommand, MacosConf};
 #[cfg(windows)]
 use mitmproxy::packet_sources::windows::WindowsConf;
 
 use pyo3::prelude::*;
+#[cfg(target_os = "macos")]
+use std::os::fd::{AsRawFd, IntoRawFd};
 
 use crate::server::base::Server;
 use tokio::sync::mpsc;
+
+#[cfg(target_os = "macos")]
+type LocalCommand = MacosCommand;
+#[cfg(not(target_os = "macos"))]
+type LocalCommand = InterceptConf;
 
 #[pyclass(module = "mitmproxy_rs.local")]
 #[derive(Debug)]
 pub struct LocalRedirector {
     server: Server,
-    conf_tx: mpsc::UnboundedSender<InterceptConf>,
+    conf_tx: mpsc::UnboundedSender<LocalCommand>,
     spec: String,
+    #[cfg(target_os = "macos")]
+    control_transferred: bool,
 }
 
 impl LocalRedirector {
-    pub fn new(server: Server, conf_tx: mpsc::UnboundedSender<InterceptConf>) -> Self {
+    pub fn new(server: Server, conf_tx: mpsc::UnboundedSender<LocalCommand>) -> Self {
         Self {
             server,
             conf_tx,
             spec: "inactive".to_string(),
+            #[cfg(target_os = "macos")]
+            control_transferred: false,
         }
     }
 }
 
 #[pymethods]
 impl LocalRedirector {
+    /// Check packaged and installed macOS bundle contents without installing or launching.
+    #[cfg(target_os = "macos")]
+    #[staticmethod]
+    fn installation_is_current(py: Python<'_>) -> PyResult<bool> {
+        Ok(macos::bundle_matches(
+            &macos::archive_path(py)?,
+            std::path::Path::new("/Applications"),
+        )?)
+    }
+
     /// Return a textual description of the given spec,
     /// or raise a ValueError if the spec is invalid.
     #[staticmethod]
@@ -44,12 +65,51 @@ impl LocalRedirector {
 
     /// Set a new intercept spec.
     pub fn set_intercept(&mut self, spec: String) -> PyResult<()> {
+        #[cfg(target_os = "macos")]
+        if self.control_transferred {
+            return Err(PyValueError::new_err(
+                "The watchdog owns the control socket.",
+            ));
+        }
         let conf = InterceptConf::try_from(spec.as_str())?;
         self.spec = spec;
+        #[cfg(target_os = "macos")]
+        let conf = MacosCommand::SetIntercept(conf);
         self.conf_tx
             .send(conf)
             .map_err(crate::util::event_queue_unavailable)?;
         Ok(())
+    }
+
+    /// Transfer exclusive control writes to a Python socket owned by a watchdog.
+    /// This awaits earlier configurations and disables subsequent set_intercept calls.
+    #[cfg(target_os = "macos")]
+    fn take_control_socket<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        if self.control_transferred {
+            return Err(PyValueError::new_err(
+                "The watchdog already owns the control socket.",
+            ));
+        }
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        self.conf_tx
+            .send(MacosCommand::TakeControl(reply))
+            .map_err(crate::util::event_queue_unavailable)?;
+        self.control_transferred = true;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let fd = receiver
+                .await
+                .map_err(|_| anyhow::anyhow!("Control transfer failed."))?;
+            Python::attach(|py| -> PyResult<Py<PyAny>> {
+                let kwargs = pyo3::types::PyDict::new(py);
+                kwargs.set_item("fileno", fd.as_raw_fd())?;
+                let socket = py
+                    .import("socket")?
+                    .getattr("socket")?
+                    .call((), Some(&kwargs))?;
+                let _ = fd.into_raw_fd(); // The Python socket now owns the descriptor, including cancellation.
+                Ok(socket.unbind())
+            })
+        })
     }
 
     /// Close the OS proxy server.
@@ -137,11 +197,7 @@ pub fn start_local_redirector(
     }
     #[cfg(target_os = "macos")]
     {
-        let module_filename = py.import("mitmproxy_macos")?.filename()?;
-        let redirector_tar = std::path::Path::new(module_filename.to_str()?)
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("invalid path"))?
-            .join("Mitmproxy Redirector.app.tar");
+        let redirector_tar = macos::archive_path(py)?;
         let copy_task = macos::copy_redirector_app(redirector_tar)?;
         let conf = MacosConf;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -165,8 +221,67 @@ pub fn start_local_redirector(
 mod macos {
     use super::*;
     use anyhow::{Context, Result};
+    use std::io::Read;
     use std::path::{Path, PathBuf};
     use std::{env, fs};
+
+    pub(super) fn archive_path(py: Python<'_>) -> PyResult<PathBuf> {
+        let filename = py.import("mitmproxy_macos")?.filename()?;
+        Ok(Path::new(filename.to_str()?)
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("invalid path"))?
+            .join("Mitmproxy Redirector.app.tar"))
+    }
+
+    /// Compare bundle bytes so reinstalling a wheel never reinstalls an identical app.
+    pub(super) fn bundle_matches(archive: &Path, applications: &Path) -> Result<bool> {
+        let mut archive = tar::Archive::new(fs::File::open(archive)?);
+        let mut files = 0;
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            let relative = entry.path()?;
+            if !relative.starts_with("Mitmproxy Redirector.app")
+                || relative
+                    .components()
+                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            {
+                anyhow::bail!("invalid redirector archive path");
+            }
+            let destination = applications.join(&relative);
+            let metadata = match fs::symlink_metadata(&destination) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error.into()),
+            };
+            if entry.header().entry_type().is_dir() {
+                if !metadata.is_dir() {
+                    return Ok(false);
+                }
+                continue;
+            }
+            if !entry.header().entry_type().is_file()
+                || !metadata.is_file()
+                || metadata.len() != entry.size()
+            {
+                return Ok(false);
+            }
+            let mut installed = fs::File::open(destination)?;
+            let mut expected = [0_u8; 16384];
+            let mut actual = [0_u8; 16384];
+            loop {
+                let count = entry.read(&mut expected)?;
+                if count == 0 {
+                    break;
+                }
+                installed.read_exact(&mut actual[..count])?;
+                if expected[..count] != actual[..count] {
+                    return Ok(false);
+                }
+            }
+            files += 1;
+        }
+        Ok(files > 0)
+    }
 
     /// Ensure "Mitmproxy Redirector.app" is installed into /Applications and up-to-date.
     pub(super) fn copy_redirector_app(
@@ -180,20 +295,11 @@ mod macos {
         if !redirector_tar.exists() {
             return Err(anyhow::anyhow!("{} does not exist", redirector_tar.display()).into());
         }
-        let expected_mtime = fs::metadata(&redirector_tar)
-            .and_then(|x| x.modified())
-            .context("failed to get mtime for redirector")?;
-
-        let info_plist = Path::new("/Applications/Mitmproxy Redirector.app/Contents/Info.plist");
-        if let Ok(actual_mtime) = fs::metadata(info_plist).and_then(|m| m.modified()) {
-            if actual_mtime == expected_mtime {
-                log::debug!("Existing mitmproxy redirector app is up-to-date.");
-                return Ok(None);
-            }
-            log::info!("Updating mitmproxy redirector app...");
-        } else {
-            log::info!("Installing mitmproxy redirector app...");
-        };
+        if bundle_matches(&redirector_tar, Path::new("/Applications"))? {
+            log::debug!("Existing mitmproxy redirector app is up-to-date.");
+            return Ok(None);
+        }
+        log::info!("Installing packaged mitmproxy redirector app...");
 
         Ok(Some(move || {
             let archive_file = fs::File::open(redirector_tar)?;
@@ -206,10 +312,42 @@ mod macos {
             }
             archive
                 .unpack(destination_path.parent().unwrap())
-                .context("failed to unpack redirector")?;
-            fs::File::open(info_plist)
-                .and_then(|f| f.set_modified(expected_mtime))
-                .context("failed to set redirector mtime")
+                .context("failed to unpack redirector")
         }))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn installed_bundle_identity_ignores_timestamps_but_checks_every_file() -> Result<()> {
+            let directory = tempfile::tempdir()?;
+            let archive = directory.path().join("redirector.tar");
+            let member = "Mitmproxy Redirector.app/Contents/Info.plist";
+            let payload = b"signed app bytes";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(payload.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(100);
+            header.set_cksum();
+            let mut builder = tar::Builder::new(fs::File::create(&archive)?);
+            builder.append_data(&mut header, member, &payload[..])?;
+            builder.finish()?;
+            let applications = directory.path().join("Applications");
+            assert!(!bundle_matches(&archive, &applications)?);
+            let installed = applications.join(member);
+            fs::create_dir_all(installed.parent().unwrap())?;
+            fs::write(&installed, payload)?;
+            assert!(bundle_matches(&archive, &applications)?);
+            fs::File::open(&archive)?.set_modified(std::time::SystemTime::UNIX_EPOCH)?;
+            assert!(bundle_matches(&archive, &applications)?);
+            fs::write(&installed, b"changed app data")?;
+            assert!(!bundle_matches(&archive, &applications)?);
+            fs::remove_file(&installed)?;
+            std::os::unix::fs::symlink(&archive, &installed)?;
+            assert!(!bundle_matches(&archive, &applications)?);
+            Ok(())
+        }
     }
 }
