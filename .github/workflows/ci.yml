@@ -68,13 +68,15 @@ jobs:
 
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - name: windows-x86_64
             os: windows-latest
           - name: linux-x86_64
             os: ubuntu-latest
-            args: --compatibility manylinux2014 --zig --sdist
+            args: --compatibility manylinux2014 --zig
+            sdist: true
           - name: linux-arm64
             os: ubuntu-24.04-arm
             args: --compatibility manylinux2014 --zig
@@ -113,9 +115,12 @@ jobs:
       - run: maturin build --release --locked ${{ matrix.args }}
         working-directory: ./mitmproxy-rs
 
-      # ensure that sdist is building.
-      # We do this here instead of a separate job because we don't want to wait for the entire matrix.
-      - if: contains(matrix.args, 'sdist')
+      # Maturin prunes the workspace when creating an sdist, so its metadata
+      # resolution cannot use the wheel build's --locked flag.
+      - if: matrix.sdist
+        run: maturin sdist
+        working-directory: ./mitmproxy-rs
+      - if: matrix.sdist
         run: pip install --no-dependencies target/wheels/*.tar.gz
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
