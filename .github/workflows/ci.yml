@@ -7,13 +7,14 @@ on:
     tags:
       - 'exp-v*'
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
@@ -109,7 +110,7 @@ jobs:
         name: Install maturin from PyPI
         uses: install-pinned/maturin@3bfd83cd34bdcbcc8a10e459c2a9e41e6c33e706
 
-      - run: maturin build --release ${{ matrix.args }}
+      - run: maturin build --release --locked ${{ matrix.args }}
         working-directory: ./mitmproxy-rs
 
       # ensure that sdist is building.
@@ -131,9 +132,24 @@ jobs:
     with:
       jobs: ${{ toJSON(needs) }}
 
+  release-check:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/exp-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require a protected release tag from main
+        env:
+          REF_PROTECTED: ${{ github.ref_protected }}
+        run: |
+          test "$REF_PROTECTED" = true
+          git merge-base --is-ancestor HEAD origin/main
+
   publish:
-    if: github.repository == 'experientiallabs/mitmproxy_rs' && startsWith(github.ref, 'refs/tags/exp-v')
-    needs: check
+    if: github.repository == 'experientiallabs/mitmproxy_rs' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/exp-v')
+    needs: [check, release-check]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -147,3 +163,5 @@ jobs:
           path: dist
       - name: Publish tested distributions to PyPI
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          skip-existing: true
