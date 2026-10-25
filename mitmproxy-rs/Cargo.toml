@@ -36,6 +36,7 @@ nix = { version = "0.31.2", features = ["user"] }
 
 [dev-dependencies]
 env_logger = "0.11"
+tempfile = "3.20.0"
 
 [features]
 tracing = ["console-subscriber"]
