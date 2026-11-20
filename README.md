@@ -45,3 +45,11 @@ This repository contains mitmproxy's Rust bits, most notably:
 ### Architecture
 
 ![library architecture](architecture.png)
+
+### DNS dependency maintenance
+
+The resolver, protocol and network crates are locked together at Hickory 0.26.2
+to include the resolver security fixes. Updating only the resolver is insufficient:
+its fixed error paths use the matching network/protocol error variants. The DNS
+unit tests exercise IPv4/IPv6 lookups against a local test server. This dependency
+update does not publish a Python wheel or modify certificate trust.
